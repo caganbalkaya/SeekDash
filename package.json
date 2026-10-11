@@ -1,0 +1,37 @@
+{
+  "name": "seekdash-launcher",
+  "private": true,
+  "version": "1.0.0",
+  "description": "SeekDash — a local-first launcher for Windows 10 and 11.",
+  "author": "Çağan Balkaya",
+  "license": "GPL-3.0-only",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "release": "tauri build && node scripts/copy-release.mjs",
+    "installer": "tauri build --target x86_64-pc-windows-msvc --bundles nsis && node scripts/copy-installer.mjs",
+    "checksum": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/checksum-release.ps1",
+    "test": "vitest run",
+    "tauri": "tauri"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.8.0",
+    "@tauri-apps/plugin-dialog": "^2.4.0",
+    "lucide-react": "^0.468.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.8.4",
+    "@testing-library/jest-dom": "^6.6.3",
+    "@testing-library/react": "^16.1.0",
+    "@types/react": "^18.3.18",
+    "@types/react-dom": "^18.3.5",
+    "@vitejs/plugin-react": "^4.3.4",
+    "jsdom": "^25.0.1",
+    "typescript": "~5.6.3",
+    "vite": "^6.0.5",
+    "vitest": "^2.1.8"
+  }
+}

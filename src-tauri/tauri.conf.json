@@ -1,0 +1,64 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "SeekDash",
+  "version": "1.0.0",
+  "identifier": "com.glass.launcher",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://127.0.0.1:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "SeekDash",
+        "width": 720,
+        "height": 82,
+        "minWidth": 56,
+        "minHeight": 82,
+        "resizable": false,
+        "fullscreen": false,
+        "decorations": false,
+        "transparent": true,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "visible": false,
+        "shadow": false,
+        "center": true
+      }
+    ],
+    "security": { "csp": "default-src 'self'; img-src 'self' asset: data:; style-src 'self' 'unsafe-inline'; connect-src ipc: http://ipc.localhost" }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis"],
+    "publisher": "Çağan Balkaya",
+    "homepage": "https://seekdash.com.tr",
+    "copyright": "Copyright © 2026 Çağan Balkaya",
+    "shortDescription": "Local-first Windows launcher",
+    "longDescription": "Search. Launch. Act. Find applications, files, clipboard entries and quick actions locally on Windows 10 and 11.",
+    "icon": ["icons/icon.ico", "icons/icon.png"],
+    "windows": {
+      "allowDowngrades": false,
+      "webviewInstallMode": {
+        "type": "downloadBootstrapper",
+        "silent": true
+      },
+      "nsis": {
+        "installMode": "currentUser",
+        "languages": ["English", "Turkish", "German", "French"],
+        "displayLanguageSelector": true,
+        "compression": "lzma",
+        "startMenuFolder": "SeekDash",
+        "installerHooks": "installer/installer-hooks.nsh",
+        "installerIcon": "icons/icon.ico",
+        "uninstallerIcon": "icons/icon.ico",
+        "headerImage": "installer-assets/header.bmp",
+        "uninstallerHeaderImage": "installer-assets/header.bmp",
+        "sidebarImage": "installer-assets/sidebar.bmp"
+      }
+    }
+  }
+}

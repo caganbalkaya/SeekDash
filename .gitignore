@@ -1,0 +1,53 @@
+# JavaScript and frontend output
+node_modules/
+dist/
+.vite/
+coverage/
+
+# Rust and Tauri output
+target/
+src-tauri/target/
+
+# Release artifacts are published through GitHub Releases, not source control
+release/
+*.exe
+*.msi
+*.msix
+*.zip
+*.sha256
+
+# Environment files and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.pfx
+*.p12
+*.key
+
+# Local application data
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.log
+logs/
+cache/
+.cache/
+backdrop-status.json
+
+# Test and machine-local output
+scratch/
+test-results/
+playwright-report/
+screenshots/local/
+*.tmp
+*.bak
+
+# Editors and operating systems
+.idea/
+.vscode/
+.vs/
+.DS_Store
+Thumbs.db
+Desktop.ini

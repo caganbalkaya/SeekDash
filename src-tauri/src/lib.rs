@@ -11,7 +11,10 @@ mod windows;
 use models::{AppSettings, BackdropStatus, IndexStatus, SearchResult};
 use state::{EngineState, SidebarState, WindowPhase};
 use std::{
-    fs,
+    fs::{self, OpenOptions},
+    io::Write,
+    os::windows::ffi::OsStrExt,
+    path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
     time::{Duration, Instant},
 };
@@ -28,6 +31,92 @@ fn settings_path(app: &AppHandle) -> Result<std::path::PathBuf, String> {
     let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     Ok(dir.join("settings.json"))
+}
+
+fn settings_backup_path(path: &Path) -> PathBuf {
+    path.with_extension("json.bak")
+}
+
+fn read_settings_file(path: &Path) -> Option<AppSettings> {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+}
+
+fn read_settings_with_backup(path: &Path) -> (Option<AppSettings>, bool) {
+    if let Some(settings) = read_settings_file(path) {
+        return (Some(settings), false);
+    }
+    (
+        read_settings_file(&settings_backup_path(path)),
+        path.exists(),
+    )
+}
+
+fn wide_path(path: &Path) -> Vec<u16> {
+    path.as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect()
+}
+
+fn write_settings_atomic(path: &Path, content: &[u8]) -> Result<(), String> {
+    use ::windows::{
+        core::PCWSTR,
+        Win32::Storage::FileSystem::{
+            MoveFileExW, ReplaceFileW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+            REPLACEFILE_WRITE_THROUGH,
+        },
+    };
+
+    let temp = path.with_extension("json.tmp");
+    let backup = settings_backup_path(path);
+    let mut file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&temp)
+        .map_err(|error| error.to_string())?;
+    file.write_all(content).map_err(|error| error.to_string())?;
+    file.sync_all().map_err(|error| error.to_string())?;
+    drop(file);
+
+    let result = if path.exists() {
+        let destination = wide_path(path);
+        let replacement = wide_path(&temp);
+        let current_is_valid = read_settings_file(path).is_some();
+        let backup_wide = current_is_valid.then(|| {
+            let _ = fs::remove_file(&backup);
+            wide_path(&backup)
+        });
+        unsafe {
+            ReplaceFileW(
+                PCWSTR(destination.as_ptr()),
+                PCWSTR(replacement.as_ptr()),
+                backup_wide
+                    .as_ref()
+                    .map_or(PCWSTR::null(), |value| PCWSTR(value.as_ptr())),
+                REPLACEFILE_WRITE_THROUGH,
+                None,
+                None,
+            )
+        }
+    } else {
+        let source = wide_path(&temp);
+        let destination = wide_path(path);
+        unsafe {
+            MoveFileExW(
+                PCWSTR(source.as_ptr()),
+                PCWSTR(destination.as_ptr()),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        }
+    };
+    if let Err(error) = result {
+        let _ = fs::remove_file(&temp);
+        return Err(error.to_string());
+    }
+    Ok(())
 }
 
 fn supported_language(value: &str) -> Option<&'static str> {
@@ -168,13 +257,44 @@ mod language_tests {
     }
 }
 
+#[cfg(test)]
+mod settings_file_tests {
+    use super::{read_settings_with_backup, write_settings_atomic};
+    use crate::models::AppSettings;
+
+    #[test]
+    fn atomic_settings_write_keeps_a_recoverable_backup() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.json");
+        let mut first = AppSettings::default();
+        first.hotkey = "Alt+Space".into();
+        write_settings_atomic(&path, &serde_json::to_vec(&first).unwrap()).unwrap();
+
+        let mut second = first.clone();
+        second.hotkey = "Ctrl+Space".into();
+        write_settings_atomic(&path, &serde_json::to_vec(&second).unwrap()).unwrap();
+        std::fs::write(&path, b"{broken").unwrap();
+
+        let (recovered, used_backup) = read_settings_with_backup(&path);
+        assert!(used_backup);
+        assert_eq!(recovered.unwrap().hotkey, "Alt+Space");
+    }
+}
+
 fn load_settings(app: &AppHandle) -> AppSettings {
-    let mut settings: AppSettings = settings_path(app)
-        .ok()
-        .and_then(|path| fs::read_to_string(path).ok())
-        .and_then(|text| serde_json::from_str(&text).ok())
-        .unwrap_or_default();
+    let path = settings_path(app).ok();
+    let (loaded, recovered) = path
+        .as_deref()
+        .map(read_settings_with_backup)
+        .unwrap_or((None, false));
+    let mut settings = loaded.unwrap_or_default();
     settings.language = resolve_language(&settings.language);
+    if recovered {
+        eprintln!("SeekDash settings file was invalid; recovered the last valid backup");
+        if let (Some(path), Ok(content)) = (&path, serde_json::to_vec_pretty(&settings)) {
+            let _ = write_settings_atomic(path, &content);
+        }
+    }
     settings
 }
 
@@ -263,6 +383,7 @@ fn save_settings(
     mut settings: AppSettings,
     state: tauri::State<EngineState>,
 ) -> Result<(), String> {
+    let _save = state.settings_save.lock();
     settings.clipboard_limit = settings.clipboard_limit.clamp(1, 100);
     settings.language = supported_language(&settings.language)
         .unwrap_or("en")
@@ -276,27 +397,36 @@ fn save_settings(
         *state.hotkey_error.lock() = Some(error.clone());
         return Err(error);
     }
-    if previous.hotkey != settings.hotkey || previous.clipboard_hotkey != settings.clipboard_hotkey
-    {
-        app.global_shortcut()
-            .unregister_all()
-            .map_err(|e| e.to_string())?;
-        if let Err(error) = register_hotkeys(&app, &settings) {
-            let _ = app.global_shortcut().unregister_all();
-            let _ = register_hotkeys(&app, &previous);
+    let content = serde_json::to_vec_pretty(&settings).map_err(|error| error.to_string())?;
+    let path = settings_path(&app)?;
+    let hotkeys_changed = previous.hotkey != settings.hotkey
+        || previous.clipboard_hotkey != settings.clipboard_hotkey;
+    if hotkeys_changed {
+        if let Err(error) = replace_hotkeys(&app, &settings) {
+            let _ = replace_hotkeys(&app, &previous);
             let error = format!("i18n:backend.hotkeyUnavailable|{error}");
             *state.hotkey_error.lock() = Some(error.clone());
             return Err(error);
         }
         *state.hotkey_error.lock() = None;
     }
-    let content = serde_json::to_string_pretty(&settings).map_err(|e| e.to_string())?;
-    fs::write(settings_path(&app)?, content).map_err(|e| e.to_string())?;
-    let autostart = app.autolaunch();
-    if settings.launch_at_startup {
-        autostart.enable().map_err(|e| e.to_string())?;
-    } else {
-        autostart.disable().map_err(|e| e.to_string())?;
+    let autostart_changed = previous.launch_at_startup != settings.launch_at_startup;
+    if autostart_changed {
+        if let Err(error) = apply_autostart(&app, settings.launch_at_startup, false) {
+            if hotkeys_changed {
+                let _ = replace_hotkeys(&app, &previous);
+            }
+            return Err(error);
+        }
+    }
+    if let Err(error) = write_settings_atomic(&path, &content) {
+        if autostart_changed {
+            let _ = apply_autostart(&app, previous.launch_at_startup, false);
+        }
+        if hotkeys_changed {
+            let _ = replace_hotkeys(&app, &previous);
+        }
+        return Err(error);
     }
     let roots_changed = previous.indexed_directories != settings.indexed_directories
         || previous.excluded_directories != settings.excluded_directories;
@@ -381,12 +511,92 @@ fn register_hotkeys(app: &AppHandle, settings: &AppSettings) -> Result<(), Strin
         .map_err(|e| format!("{}: {e}", settings.clipboard_hotkey))
 }
 
+fn replace_hotkeys(app: &AppHandle, settings: &AppSettings) -> Result<(), String> {
+    let state = app.state::<EngineState>();
+    let _registration = state.hotkey_registration.lock();
+    app.global_shortcut()
+        .unregister_all()
+        .map_err(|error| error.to_string())?;
+    if let Err(error) = register_hotkeys(app, settings) {
+        let _ = app.global_shortcut().unregister_all();
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn schedule_hotkey_recovery(app: &AppHandle) {
+    let state = app.state::<EngineState>();
+    if state.hotkey_recovery_running.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let handle = app.clone();
+    std::thread::spawn(move || {
+        let mut last_error = None;
+        for delay in [100, 750, 2_000] {
+            std::thread::sleep(Duration::from_millis(delay));
+            let settings = handle.state::<EngineState>().settings.lock().clone();
+            match replace_hotkeys(&handle, &settings) {
+                Ok(()) => {
+                    *handle.state::<EngineState>().hotkey_error.lock() = None;
+                    last_error = None;
+                    break;
+                }
+                Err(error) => last_error = Some(error),
+            }
+        }
+        if let Some(error) = last_error {
+            *handle.state::<EngineState>().hotkey_error.lock() =
+                Some(format!("i18n:backend.hotkeyUnavailable|{error}"));
+        }
+        handle
+            .state::<EngineState>()
+            .hotkey_recovery_running
+            .store(false, Ordering::Release);
+    });
+}
+
+fn apply_autostart(app: &AppHandle, enabled: bool, refresh_path: bool) -> Result<(), String> {
+    let autostart = app.autolaunch();
+    if enabled {
+        if refresh_path {
+            let _ = autostart.disable();
+        }
+        autostart.enable().map_err(|error| error.to_string())?;
+    } else {
+        autostart.disable().map_err(|error| error.to_string())?;
+    }
+    let actual = autostart.is_enabled().map_err(|error| error.to_string())?;
+    if actual != enabled {
+        return Err(if enabled {
+            "Windows startup registration could not be enabled".into()
+        } else {
+            "Windows startup registration could not be disabled".into()
+        });
+    }
+    Ok(())
+}
+
 fn log_timing(label: &str, elapsed: Duration) {
     #[cfg(debug_assertions)]
     eprintln!("SeekDash timing: {label} {elapsed:?}");
     if elapsed > Duration::from_millis(500) {
         eprintln!("SeekDash slow-operation: {label} took {elapsed:?}");
     }
+}
+
+fn focus_window_with_retry(window: &tauri::WebviewWindow) {
+    let _ = window.unminimize();
+    if window.set_focus().is_ok() {
+        return;
+    }
+    let window = window.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(60));
+        if window.is_visible().unwrap_or(false) {
+            let _ = window.unminimize();
+            let _ = window.set_focus();
+        }
+    });
 }
 
 fn hide_launcher_window(app: &AppHandle) {
@@ -400,12 +610,17 @@ fn hide_launcher_window(app: &AppHandle) {
         runtime.clipboard_visible
     };
     if let Some(window) = app.get_webview_window("main") {
-        let _ = window.hide();
+        if let Err(error) = window.hide() {
+            eprintln!("SeekDash launcher could not be hidden: {error}");
+            app.state::<EngineState>().windows.lock().phase = WindowPhase::Visible;
+            return;
+        }
     }
     let mut runtime = state.windows.lock();
     runtime.phase = WindowPhase::Hidden;
     runtime.sidebar_state = SidebarState::Hidden;
     runtime.clipboard_visible = false;
+    runtime.launcher_shown_at = None;
     drop(runtime);
     if was_clipboard {
         let _ = app.emit("clipboard-closed", ());
@@ -497,6 +712,7 @@ fn set_sidebar_state_internal(app: &AppHandle, target: SidebarState) -> Result<(
         runtime.sidebar_state = target;
         runtime.phase = WindowPhase::Hidden;
         runtime.clipboard_visible = false;
+        runtime.launcher_shown_at = None;
         let _ = app.emit("sidebar-state-changed", target.as_str());
         let _ = app.emit("clipboard-closed", ());
         return Ok(());
@@ -507,16 +723,24 @@ fn set_sidebar_state_internal(app: &AppHandle, target: SidebarState) -> Result<(
         runtime.phase = WindowPhase::Opening;
         runtime.sidebar_state = target;
         runtime.clipboard_visible = false;
+        runtime.launcher_shown_at = Some(Instant::now());
     }
     position_launcher(&window, &settings, target);
     let _ = windows::apply_rounded_region(&window, 22.0);
-    window.show().map_err(|error| error.to_string())?;
+    if let Err(error) = window.show() {
+        let state = app.state::<EngineState>();
+        let mut runtime = state.windows.lock();
+        runtime.phase = WindowPhase::Hidden;
+        runtime.sidebar_state = SidebarState::Hidden;
+        runtime.launcher_shown_at = None;
+        return Err(error.to_string());
+    }
     let _ = app.emit("sidebar-state-changed", target.as_str());
     if target == SidebarState::Collapsed {
         let _ = app.emit("clipboard-closed", ());
     }
     if target == SidebarState::Expanded {
-        window.set_focus().map_err(|error| error.to_string())?;
+        focus_window_with_retry(&window);
         let _ = app.emit("launcher-opened", ());
     }
     app.state::<EngineState>().windows.lock().phase = WindowPhase::Visible;
@@ -566,20 +790,62 @@ fn toggle_launcher(app: &AppHandle) {
         let _ = set_sidebar_state_internal(app, target);
         return;
     }
-    if matches!(phase, WindowPhase::Visible | WindowPhase::Opening)
-        || window.is_visible().unwrap_or(false)
+    if window.is_visible().unwrap_or(false)
+        && matches!(phase, WindowPhase::Visible | WindowPhase::Opening)
     {
         hide_launcher_window(app);
         return;
     }
-    state.windows.lock().phase = WindowPhase::Opening;
-    state.windows.lock().clipboard_visible = false;
+    {
+        let mut runtime = state.windows.lock();
+        runtime.phase = WindowPhase::Opening;
+        runtime.clipboard_visible = false;
+        runtime.launcher_shown_at = Some(Instant::now());
+    }
     position_launcher(&window, &settings, SidebarState::Expanded);
     let _ = windows::apply_rounded_region(&window, 22.0);
-    let _ = window.show();
-    let _ = window.set_focus();
+    if let Err(error) = window.show() {
+        eprintln!("SeekDash launcher could not be shown: {error}");
+        let mut runtime = state.windows.lock();
+        runtime.phase = WindowPhase::Hidden;
+        runtime.launcher_shown_at = None;
+        return;
+    }
+    focus_window_with_retry(&window);
     let _ = app.emit("launcher-opened", ());
     state.windows.lock().phase = WindowPhase::Visible;
+}
+
+fn show_launcher(app: &AppHandle) {
+    let Some(window) = app.get_webview_window("main") else {
+        return;
+    };
+    let state = app.state::<EngineState>();
+    let (phase, clipboard_visible) = {
+        let runtime = state.windows.lock();
+        (runtime.phase, runtime.clipboard_visible)
+    };
+    if phase == WindowPhase::SettingsVisible {
+        if let Some(settings_window) = app.get_webview_window("settings") {
+            let _ = settings_window.hide();
+        }
+    }
+    if state.settings.lock().layout_mode == "vertical" {
+        if let Err(error) = set_sidebar_state_internal(app, SidebarState::Expanded) {
+            eprintln!("SeekDash sidebar could not be shown: {error}");
+        }
+        return;
+    }
+    if !window.is_visible().unwrap_or(false) {
+        toggle_launcher(app);
+        return;
+    }
+    if clipboard_visible {
+        state.windows.lock().clipboard_visible = false;
+        let _ = app.emit("clipboard-closed", ());
+    }
+    focus_window_with_retry(&window);
+    let _ = app.emit("launcher-opened", ());
 }
 
 fn toggle_clipboard(app: &AppHandle) {
@@ -606,11 +872,19 @@ fn toggle_clipboard(app: &AppHandle) {
         runtime.phase = WindowPhase::Opening;
         runtime.clipboard_visible = true;
         runtime.sidebar_state = SidebarState::Expanded;
+        runtime.launcher_shown_at = Some(Instant::now());
     }
     position_clipboard(&window, &settings);
     let _ = windows::apply_rounded_region(&window, 22.0);
-    let _ = window.show();
-    let _ = window.set_focus();
+    if let Err(error) = window.show() {
+        eprintln!("SeekDash clipboard could not be shown: {error}");
+        let mut runtime = state.windows.lock();
+        runtime.phase = WindowPhase::Hidden;
+        runtime.clipboard_visible = false;
+        runtime.launcher_shown_at = None;
+        return;
+    }
+    focus_window_with_retry(&window);
     let _ = app.emit("clipboard-opened", ());
     state.windows.lock().phase = WindowPhase::Visible;
 }
@@ -746,9 +1020,9 @@ fn tray_image() -> tauri::image::Image<'static> {
 }
 
 pub fn run() {
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _, _| {
-            toggle_launcher(app)
+            show_launcher(app)
         }))
         .plugin(tauri_plugin_dialog::init())
         .plugin(
@@ -798,8 +1072,14 @@ pub fn run() {
                 shortcut_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
                 clipboard: Default::default(),
                 hotkey_error: parking_lot::Mutex::new(None),
+                settings_save: parking_lot::Mutex::new(()),
+                hotkey_registration: parking_lot::Mutex::new(()),
+                hotkey_recovery_running: std::sync::atomic::AtomicBool::new(false),
                 windows: parking_lot::Mutex::new(Default::default()),
             });
+            if let Err(error) = apply_autostart(&handle, settings.launch_at_startup, true) {
+                eprintln!("SeekDash startup registration could not be reconciled: {error}");
+            }
             clipboard::initialize(&handle);
 
             let backdrop = handle
@@ -818,11 +1098,11 @@ pub fn run() {
             if let Err(error) = create_settings_window(&handle) {
                 eprintln!("Ayarlar penceresi önceden oluşturulamadı: {error}");
             }
-            let _ = handle.global_shortcut().unregister_all();
-            if let Err(error) = register_hotkeys(&handle, &settings) {
+            if let Err(error) = replace_hotkeys(&handle, &settings) {
                 *handle.state::<EngineState>().hotkey_error.lock() =
-                    Some(format!("Global kısayol kaydedilemedi: {error}"));
+                    Some(format!("i18n:backend.hotkeyUnavailable|{error}"));
                 eprintln!("{error}");
+                schedule_hotkey_recovery(&handle);
             }
 
             let menu = tray_menu(&handle, &settings.language)?;
@@ -843,7 +1123,7 @@ pub fn run() {
                     }
                 })
                 .on_menu_event(|app, event| match event.id.as_ref() {
-                    "open" => toggle_launcher(app),
+                    "open" => show_launcher(app),
                     "settings" => {
                         if let Err(error) = open_settings(app) {
                             eprintln!("Ayarlar açılamadı: {error}");
@@ -882,15 +1162,24 @@ pub fn run() {
                 WindowEvent::Focused(false) if window.label() == "main" => {
                     let state = app.state::<EngineState>();
                     let settings = state.settings.lock().clone();
-                    let (phase, sidebar_state) = {
+                    let (phase, sidebar_state, recently_shown) = {
                         let runtime = state.windows.lock();
-                        (runtime.phase, runtime.sidebar_state)
+                        (
+                            runtime.phase,
+                            runtime.sidebar_state,
+                            runtime
+                                .launcher_shown_at
+                                .is_some_and(|shown| shown.elapsed() < Duration::from_millis(250)),
+                        )
                     };
+                    if recently_shown {
+                        return;
+                    }
                     if settings.layout_mode == "vertical" {
                         if settings.sidebar_auto_hide && sidebar_state == SidebarState::Expanded {
                             let _ = set_sidebar_state_internal(app, SidebarState::Collapsed);
                         }
-                    } else if matches!(phase, WindowPhase::Visible | WindowPhase::Opening) {
+                    } else if phase == WindowPhase::Visible {
                         hide_launcher_window(app);
                     }
                 }
@@ -930,6 +1219,11 @@ pub fn run() {
             quick_actions::execute_quick_action,
             quick_actions::copy_command_value
         ])
-        .run(tauri::generate_context!())
-        .expect("failed to run SeekDash");
+        .build(tauri::generate_context!())
+        .expect("failed to build SeekDash");
+    app.run(|app, event| {
+        if matches!(event, tauri::RunEvent::Resumed) {
+            schedule_hotkey_recovery(app);
+        }
+    });
 }

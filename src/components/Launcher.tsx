@@ -118,20 +118,27 @@ export function Launcher() {
   const open = async (index: number, action: "open" | "reveal" | "properties" | "runas" = "open") => {
     const result = results[index];
     if (!result || !isTauri()) return;
-    const launch = invoke("launch_result", { result, action });
-    if (action === "open" || action === "runas") {
-      setQuery("");
-      if (layoutMode === "vertical") void invoke("set_sidebar_state", { state: "collapsed" });
-      else void invoke("hide_launcher");
-      void launch.catch((error) => console.error("Open failed", error));
-      return;
+    try {
+      await invoke("launch_result", { result, action });
+      if (action === "open" || action === "runas") {
+        setQuery("");
+        if (layoutMode === "vertical") await invoke("set_sidebar_state", { state: "collapsed" });
+        else await invoke("hide_launcher");
+      }
+    } catch (error) {
+      console.error("Open failed", error);
+      finishCommand(String(error));
     }
-    await launch;
   };
 
-  const openDockResult = (result: typeof results[number]) => {
+  const openDockResult = async (result: typeof results[number]) => {
     if (!isTauri()) return;
-    void invoke("launch_result", { result, action: "open" }).catch((error) => console.error("Open failed", error));
+    try {
+      await invoke("launch_result", { result, action: "open" });
+    } catch (error) {
+      console.error("Open failed", error);
+      finishCommand(String(error));
+    }
   };
 
   const dockContextAction = async (result:typeof results[number], action:"reveal"|"copy_path"|"properties"|"runas") => {

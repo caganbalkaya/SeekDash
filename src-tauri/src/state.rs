@@ -4,7 +4,11 @@ use crate::{
     models::{AppSettings, IndexStatus},
 };
 use parking_lot::Mutex;
-use std::{collections::HashMap, sync::atomic::AtomicU64, time::Instant};
+use std::{
+    collections::HashMap,
+    sync::atomic::{AtomicBool, AtomicU64},
+    time::Instant,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WindowPhase {
@@ -39,6 +43,7 @@ pub struct WindowRuntime {
     pub settings_create_started: Option<Instant>,
     pub settings_open_started: Option<Instant>,
     pub clipboard_visible: bool,
+    pub launcher_shown_at: Option<Instant>,
 }
 
 impl Default for WindowRuntime {
@@ -50,6 +55,7 @@ impl Default for WindowRuntime {
             settings_create_started: None,
             settings_open_started: None,
             clipboard_visible: false,
+            launcher_shown_at: None,
         }
     }
 }
@@ -65,5 +71,8 @@ pub struct EngineState {
     pub shortcut_cache: Mutex<HashMap<String, String>>,
     pub clipboard: ClipboardStore,
     pub hotkey_error: Mutex<Option<String>>,
+    pub settings_save: Mutex<()>,
+    pub hotkey_registration: Mutex<()>,
+    pub hotkey_recovery_running: AtomicBool,
     pub windows: Mutex<WindowRuntime>,
 }
